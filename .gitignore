@@ -1,0 +1,6 @@
+BRIEF*.md
+REPORT*.md
+__pycache__/
+*.pyc
+report.md
+*.bak
