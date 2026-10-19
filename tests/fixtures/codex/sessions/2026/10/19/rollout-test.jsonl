@@ -1,0 +1,3 @@
+{"timestamp": "2026-10-19T12:00:00Z", "type": "event", "payload": {"type": "token_count", "info": null, "rate_limits": null}}
+{broken json line for codex
+{"timestamp": "2026-10-19T12:05:00Z", "type": "event", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}}, "rate_limits": {"primary": {"used_percent": 25.0, "window_minutes": 10080, "resets_at": 1791949620}}}}

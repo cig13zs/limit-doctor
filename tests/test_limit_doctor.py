@@ -1,0 +1,172 @@
+"""Unit tests for limit-doctor."""
+
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import unittest
+
+from limit_doctor import (
+    Turn,
+    analyze_usage,
+    count_image_blocks,
+    extract_mcp_servers_from_content,
+    find_configured_mcp_servers,
+    format_markdown,
+    format_text,
+    model_expense_tier,
+    parse_claude_logs,
+    parse_codex_logs,
+    parse_iso_ts,
+    shorten_cwd,
+)
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+class TestLimitDoctor(unittest.TestCase):
+    def setUp(self):
+        self.claude_dir = FIXTURES_DIR / "claude"
+        self.codex_dir = FIXTURES_DIR / "codex"
+        self.claude_json = FIXTURES_DIR / "claude.json"
+        # Window that includes all fixture timestamps (2026-10-19)
+        self.cutoff = datetime(2026, 10, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_parse_iso_ts(self):
+        ts = parse_iso_ts("2026-10-19T10:00:00Z")
+        self.assertIsNotNone(ts)
+        self.assertEqual(ts.year, 2026)
+        self.assertIsNone(parse_iso_ts(None))
+        self.assertIsNone(parse_iso_ts("invalid-date"))
+
+    def test_shorten_cwd(self):
+        self.assertEqual(shorten_cwd("C:/Users/alice/Desktop/repo"), "Desktop/repo")
+        self.assertEqual(shorten_cwd("/workspace/demo/proj1"), "demo/proj1")
+        self.assertEqual(shorten_cwd("single"), "single")
+        self.assertEqual(shorten_cwd(None), "unknown")
+
+    def test_count_image_blocks(self):
+        data = {
+            "type": "user",
+            "content": [
+                {"type": "text", "text": "sample"},
+                {"type": "image", "source": {}},
+                {"type": "tool_result", "content": [{"type": "image"}]},
+            ],
+        }
+        self.assertEqual(count_image_blocks(data), 2)
+        self.assertEqual(count_image_blocks({"type": "text"}), 0)
+
+    def test_extract_mcp_servers(self):
+        content = [
+            {"type": "tool_use", "name": "mcp__github__create_issue"},
+            {"type": "tool_use", "name": "normal_tool"},
+            {"type": "text", "text": "hello"},
+        ]
+        self.assertEqual(extract_mcp_servers_from_content(content), ["github"])
+
+    def test_model_expense_tier(self):
+        self.assertEqual(model_expense_tier("claude-opus-5-5"), 3)
+        self.assertEqual(model_expense_tier("claude-3-5-sonnet-20241022"), 2)
+        self.assertEqual(model_expense_tier("claude-3-5-haiku-20241022"), 1)
+        self.assertEqual(model_expense_tier("other-model"), 0)
+
+    def test_claude_log_parsing_dedupe_and_malformed(self):
+        """Test dedupe by message.id and skipping of malformed lines."""
+        turns, s_imgs, used_m, cwds = parse_claude_logs(self.claude_dir, self.cutoff)
+        # In session_test.jsonl: msg_001 is repeated twice, but should be deduped to 1 turn.
+        # Plus msg_002, msg_003, msg_004, and subagent sub_msg_001 = 5 turns total.
+        self.assertEqual(len(turns), 5)
+        # Check that msg_001 is only recorded once
+        turn_ids = [t.session_id for t in turns]
+        self.assertTrue(all(sid == "sess-test-1" for sid in turn_ids))
+
+        # Check used MCP servers extracted from tool_use
+        self.assertIn("used_server", used_m)
+
+        # Check images found in user messages
+        self.assertEqual(s_imgs.get("sess-test-1"), 1)
+
+    def test_idle_rebuild_detection_both_tiers(self):
+        """Test idle rebuild detection for 5m tier and 1h tier."""
+        turns, s_imgs, used_m, cwds = parse_claude_logs(self.claude_dir, self.cutoff)
+        rep = analyze_usage(
+            turns=turns,
+            session_images=s_imgs,
+            used_mcps=used_m,
+            configured_mcp=[],
+            codex_daily={},
+            codex_rl={},
+            window_days=7,
+        )
+        claude_rep = rep["claude"]
+        findings = {f["id"]: f for f in claude_rep["cost_findings"]}
+        idle = findings.get("idle_rebuilds")
+        self.assertIsNotNone(idle)
+        # Exactly 2 rebuilds:
+        # 1. msg_002: 5m tier, gap = 6 min (360s > 300s), cache write = 25,000 > 20k -> rebuild!
+        # (msg_003: 1h tier, gap = 2 min < 3600s -> not rebuild)
+        # 2. msg_004: 1h tier, gap = 67 min (4020s > 3600s), cache write = 25,000 > 20k -> rebuild!
+        self.assertEqual(idle["count"], 2)
+
+    def test_unused_mcp_detection(self):
+        """Test unused MCP servers identification across configs."""
+        turns, s_imgs, used_m, cwds = parse_claude_logs(self.claude_dir, self.cutoff)
+        cfg_m = find_configured_mcp_servers(self.claude_dir, self.claude_json, self.codex_dir, cwds)
+        rep = analyze_usage(
+            turns=turns,
+            session_images=s_imgs,
+            used_mcps=used_m,
+            configured_mcp=cfg_m,
+            codex_daily={},
+            codex_rl={},
+            window_days=7,
+        )
+        unused = rep["claude"]["unused_mcps"]
+        unused_names = {u["server"] for u in unused}
+        # used_server was called in session_test.jsonl, so it must NOT be in unused
+        self.assertNotIn("used_server", unused_names)
+        # All others should be flagged as unused
+        self.assertIn("unused_server_user", unused_names)
+        self.assertIn("unused_settings_server", unused_names)
+        self.assertIn("unused_plugin", unused_names)
+        self.assertIn("unused_codex_server", unused_names)
+        self.assertIn("unused_proj_server", unused_names)
+
+    def test_codex_null_info_and_malformed(self):
+        """Test Codex log parsing handles null info and malformed lines."""
+        daily, rl = parse_codex_logs(self.codex_dir, self.cutoff)
+        # The null info line and the malformed line should be skipped cleanly
+        # Only the valid token_count line should be recorded
+        self.assertIn("2026-10-19", daily)
+        day_data = daily["2026-10-19"]
+        self.assertEqual(day_data["input"], 1000)
+        self.assertEqual(day_data["cached"], 400)
+        self.assertEqual(day_data["output"], 50)
+        # Weighted cost: (1000 - 400)*1.0 + 400*0.1 + 50*5.0 = 600 + 40 + 250 = 890.0
+        self.assertAlmostEqual(day_data["weighted"], 890.0)
+        # Rate limit
+        self.assertEqual(rl.get("used_percent"), 25.0)
+
+    def test_output_formatters(self):
+        """Test text and markdown formatters."""
+        turns, s_imgs, used_m, cwds = parse_claude_logs(self.claude_dir, self.cutoff)
+        cfg_m = find_configured_mcp_servers(self.claude_dir, self.claude_json, self.codex_dir, cwds)
+        daily, rl = parse_codex_logs(self.codex_dir, self.cutoff)
+        rep = analyze_usage(turns, s_imgs, used_m, cfg_m, daily, rl, 7)
+
+        text = format_text(rep, is_tty=False)
+        self.assertIn("LIMIT DOCTOR v0.1", text)
+        self.assertIn("CLAUDE CODE USAGE", text)
+        self.assertIn("CODEX", text)
+        self.assertNotIn("\u2014", text)  # No em dashes
+
+        md = format_markdown(rep)
+        self.assertIn("# Limit Doctor Report", md)
+        self.assertIn("| Rank | Finding |", md)
+        self.assertIn("session-1", md)  # Masked session id in markdown
+        self.assertNotIn("sess-test-1", md)  # No raw session IDs in markdown
+        self.assertNotIn("\u2014", md)  # No em dashes
+
+
+if __name__ == "__main__":
+    unittest.main()

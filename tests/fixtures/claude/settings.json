@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "unused_settings_server": {
+      "command": "node"
+    }
+  },
+  "enabledPlugins": {
+    "unused_plugin": true,
+    "disabled_plugin": false
+  }
+}

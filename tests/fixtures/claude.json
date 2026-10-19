@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "used_server": {
+      "command": "node",
+      "args": ["server.js"]
+    },
+    "unused_server_user": {
+      "command": "python",
+      "args": ["unused.py"]
+    }
+  },
+  "projects": {
+    "/workspace/demo/proj1": {
+      "mcpServers": {
+        "unused_proj_server": {
+          "command": "npx",
+          "args": ["something"]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,3 @@
+[mcp_servers.unused_codex_server]
+command = "python"
+args = ["codex_server.py"]
