@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """limit-doctor: diagnose token usage drains and report actionable fixes.
 
-Standard library only. Compatible with Python 3.10+.
+Standard library only. Compatible with Python 3.11+.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ WEIGHT_CACHE_WRITE_5M = 1.25
 WEIGHT_CACHE_WRITE_1H = 2.0
 WEIGHT_CACHE_READ = 0.1
 WEIGHT_OUTPUT = 5.0
+IMAGE_TOKENS = 1600  # rough cost of one screenshot-sized image while it sits in context
 
 
 def parse_iso_ts(ts_str: str | None) -> datetime | None:
@@ -120,7 +121,7 @@ def find_configured_mcp_servers(
             cfgs.extend({"server": s, "scope": "user", "command": f"claude mcp remove {s} -s user"} for s in cj.get("mcpServers", {}))
             for p, pdata in cj.get("projects", {}).items():
                 if isinstance(pdata, dict):
-                    cfgs.extend({"server": s, "scope": f"project ({shorten_cwd(p)})", "command": f"claude mcp remove {s} -s project"} for s in pdata.get("mcpServers", {}))
+                    cfgs.extend({"server": s, "scope": f"local ({shorten_cwd(p)})", "command": f"claude mcp remove {s} -s local  (run in {p})"} for s in pdata.get("mcpServers", {}))
         except Exception:
             pass
 
@@ -129,7 +130,6 @@ def find_configured_mcp_servers(
         try:
             sj = json.loads(set_p.read_text(encoding="utf-8"))
             cfgs.extend({"server": s, "scope": "settings", "command": f"remove mcpServers.{s} in ~/.claude/settings.json"} for s in sj.get("mcpServers", {}))
-            cfgs.extend({"server": s, "scope": "plugin", "command": f"set enabledPlugins.{s} to false in ~/.claude/settings.json"} for s, en in sj.get("enabledPlugins", {}).items() if en)
         except Exception:
             pass
 
@@ -138,7 +138,7 @@ def find_configured_mcp_servers(
         if pj_file and pj_file.is_file():
             try:
                 pj = json.loads(pj_file.read_text(encoding="utf-8"))
-                cfgs.extend({"server": s, "scope": f"project ({shorten_cwd(cwd)})", "command": f"claude mcp remove {s} -s project"} for s in pj.get("mcpServers", {}))
+                cfgs.extend({"server": s, "scope": f"project ({shorten_cwd(cwd)})", "command": f"claude mcp remove {s} -s project  (run in {cwd})"} for s in pj.get("mcpServers", {}))
             except Exception:
                 pass
 
@@ -155,9 +155,9 @@ def find_configured_mcp_servers(
 
 def parse_claude_logs(
     claude_dir: Path, cutoff: datetime
-) -> tuple[list[Turn], dict[str, int], set[str], set[str]]:
+) -> tuple[list[Turn], dict[str, list[tuple[datetime, int]]], set[str], set[str]]:
     turns: list[Turn] = []
-    session_images: dict[str, int] = {}
+    session_images: dict[str, list[tuple[datetime, int]]] = {}
     used_mcps: set[str] = set()
     cwds: set[str] = set()
     projects_dir = claude_dir / "projects"
@@ -166,7 +166,7 @@ def parse_claude_logs(
 
     cutoff_epoch = cutoff.timestamp() - 86400
     seen_dedupe: set[str] = set()
-    files = list(projects_dir.glob("*/*.jsonl")) + list(projects_dir.glob("*/subagents/*.jsonl"))
+    files = list(projects_dir.glob("*/*.jsonl")) + list(projects_dir.glob("*/subagents/*.jsonl")) + list(projects_dir.glob("*/*/subagents/*.jsonl"))
 
     for fp in files:
         try:
@@ -185,14 +185,17 @@ def parse_claude_logs(
                     if cwd:
                         cwds.add(cwd)
 
-                    imgs = count_image_blocks(d)
-                    if imgs > 0:
-                        session_images[sid] = session_images.get(sid, 0) + imgs
+                    msg = d.get("message")
+                    imgs = count_image_blocks(msg.get("content")) if d.get("type") == "user" and isinstance(msg, dict) else 0
+                    its = parse_iso_ts(d.get("timestamp"))
+                    if imgs and its:
+                        session_images.setdefault(sid, []).extend([(its, 1)] * imgs)
+                    if d.get("subtype") == "compact_boundary" and its:
+                        session_images.setdefault(sid, []).append((its, 0))
 
                     content = []
                     if isinstance(d.get("content"), list):
                         content.extend(d["content"])
-                    msg = d.get("message")
                     if isinstance(msg, dict) and isinstance(msg.get("content"), list):
                         content.extend(msg["content"])
                     for srv in extract_mcp_servers_from_content(content):
@@ -220,6 +223,8 @@ def parse_claude_logs(
 
                         is_side = bool(d.get("isSidechain") or "subagents" in fp.parts)
                         model = msg.get("model") or d.get("requestedModel") or "unknown"
+                        if model == "<synthetic>":
+                            continue
                         turns.append(Turn(sid, ts, cwd, is_side, model, in_tok, rd_tok, cw_5m, cw_1h, out_tok, str(fp)))
         except Exception:
             continue
@@ -281,7 +286,7 @@ def parse_codex_logs(
 
 
 def analyze_usage(
-    turns: list[Turn], session_images: dict[str, int], used_mcps: set[str],
+    turns: list[Turn], session_images: dict[str, list[tuple[datetime, int]]], used_mcps: set[str],
     configured_mcp: list[dict[str, str]], codex_daily: dict[str, dict[str, float]],
     codex_rl: dict[str, object], window_days: int
 ) -> dict[str, object]:
@@ -307,10 +312,13 @@ def analyze_usage(
                 is_1h = curr.cache_write_1h > 0 and curr.cache_write_1h >= curr.cache_write_5m
                 if dt > (3600.0 if is_1h else 300.0):
                     idle_cnt += 1
-                    idle_cost += curr.weighted_cost
+                    # extra paid over reading the same tokens from a warm cache
+                    extra = (curr.cache_write_1h * WEIGHT_CACHE_WRITE_1H + curr.cache_write_5m * WEIGHT_CACHE_WRITE_5M
+                             - curr.total_cache_write * WEIGHT_CACHE_READ)
+                    idle_cost += extra
                     e = idle_by_s.setdefault(sid, {"count": 0, "cost": 0.0})
                     e["count"] += 1
-                    e["cost"] += curr.weighted_cost
+                    e["cost"] += extra
 
     # 2. Heavy session start
     start_writes = [st[0].total_cache_write for st in sessions.values() if st]
@@ -332,12 +340,20 @@ def analyze_usage(
     # 4. Long contexts
     long_s_cnt = sum(1 for st in sessions.values() if statistics.median([t.context_tokens for t in st]) > 100000)
     turns_past_100k = [t for t in turns if t.context_tokens > 100000]
-    cost_past_100k = sum(t.weighted_cost for t in turns_past_100k)
+    # only the part above 100k, re-read every turn
+    cost_past_100k = sum((t.context_tokens - 100000) * WEIGHT_CACHE_READ for t in turns_past_100k)
 
     # 5. Images
-    heavy_img_s = {s: cnt for s, cnt in session_images.items() if cnt >= 10}
-    s_totals = {s: sum(t.weighted_cost for t in st) for s, st in sessions.items()}
-    heavy_img_cost = sum(s_totals[s] for s in heavy_img_s if s in s_totals)
+    # estimate: an image is re-read every later turn until the next compaction
+    img_counts = {s: sum(k for _, k in ev) for s, ev in session_images.items()}
+    heavy_img_s = {s: n for s, n in img_counts.items() if n >= 10}
+    heavy_img_cost = 0.0
+    for sid, ev in session_images.items():
+        ev = sorted(ev, key=lambda e: e[0]); i = n = 0
+        for t in sessions.get(sid, []):
+            while i < len(ev) and ev[i][0] <= t.timestamp:
+                n = n + 1 if ev[i][1] else 0; i += 1
+            heavy_img_cost += min(n * IMAGE_TOKENS, t.context_tokens) * WEIGHT_CACHE_READ
 
     # 6. Subagents
     sub_turns = [t for t in turns if t.is_sidechain]
@@ -366,17 +382,17 @@ def analyze_usage(
     cost_findings = sorted([
         {"id": "idle_rebuilds", "name": "Cache rebuilds after idle", "weighted_cost": idle_cost, "share_pct": share(idle_cost),
          "count": idle_cnt, "worst_sessions": sorted(idle_by_s.items(), key=lambda kv: kv[1]["cost"], reverse=True)[:5],
-         "fix": "finish or /clear before stepping away; long breaks re-bill the whole context."},
-        {"id": "long_contexts", "name": "Long contexts (median context > 100k)", "weighted_cost": cost_past_100k,
+         "fix": "finish or /clear before a break; an expired cache re-bills it all."},
+        {"id": "long_contexts", "name": "Context past 100k", "weighted_cost": cost_past_100k,
          "share_pct": share(cost_past_100k), "session_count": long_s_cnt, "turns_past_100k_count": len(turns_past_100k),
          "fix": "start a new session per task."},
         {"id": "heavy_session_start", "name": "Heavy session start", "weighted_cost": start_cost, "share_pct": share(start_cost),
          "median_write": med_start, "worst_write": worst_start, "flagged": med_start > 30000,
          "fix": "fewer always-on MCP servers and a shorter CLAUDE.md."},
         {"id": "subagents", "name": "Subagents and sidechains", "weighted_cost": sub_cost, "share_pct": share(sub_cost),
-         "turn_count": len(sub_turns), "models": sub_models, "fix": "limit autonomous subagent depth and review subagent task scope."},
-        {"id": "images", "name": "Sessions with 10+ images", "weighted_cost": heavy_img_cost, "share_pct": share(heavy_img_cost),
-         "total_images": sum(session_images.values()), "heavy_session_count": len(heavy_img_s),
+         "turn_count": len(sub_turns), "models": sub_models, "fix": "cheaper models and tight briefs for mechanical subagent jobs."},
+        {"id": "images", "name": "Images kept in context (estimate)", "weighted_cost": heavy_img_cost, "share_pct": share(heavy_img_cost),
+         "total_images": sum(img_counts.values()), "heavy_session_count": len(heavy_img_s),
          "fix": "crop or downscale screenshots; prefer text reads."},
     ], key=lambda x: x["weighted_cost"], reverse=True)
 
@@ -395,7 +411,7 @@ def analyze_usage(
         de["cost"] += t.weighted_cost
 
     top_s = sorted([
-        {"session_id": sid, "date": st[0].timestamp.strftime("%Y-%m-%d"), "project": shorten_cwd(st[0].cwd),
+        {"session_id": sid, "date": st[0].timestamp.strftime("%Y-%m-%d"), "project": shorten_cwd(max(set(t.cwd for t in st), key=[t.cwd for t in st].count)),
          "turns": len(st), "weighted_cost": sum(t.weighted_cost for t in st), "share_pct": share(sum(t.weighted_cost for t in st))}
         for sid, st in sessions.items()
     ], key=lambda x: x["weighted_cost"], reverse=True)[:5]
@@ -432,11 +448,11 @@ def format_text(data: dict[str, object], is_tty: bool) -> str:
 
     out = [
         f"{b}LIMIT DOCTOR v0.1{r}",
-        f"Window: last {data['window_days']} days | Cost model: API ratios (read 0.1x, 5m write 1.25x, 1h write 2.0x, out 5.0x)",
+        f"Window: last {data['window_days']} days | Weights: input 1, read 0.1, write 1.25 (5m) or 2 (1h), output 5",
         "Percentages are shares of your own usage, not published plan limits.",
         "-" * 80,
         f"{b}CLAUDE CODE USAGE:{r} {tot:,.0f} weighted tokens across {claude.get('total_turns', 0):,} turns in {claude.get('total_sessions', 0):,} sessions\n",
-        f"{b}TOP FINDINGS (ranked by weighted token cost):{r}"
+        f"{b}TOP FINDINGS (ranked by weighted token cost; a turn can count in several):{r}"
     ]
 
     for idx, f in enumerate(claude.get("cost_findings", []), 1):
@@ -458,7 +474,7 @@ def format_text(data: dict[str, object], is_tty: bool) -> str:
             if f.get("models"):
                 out.append(f"   Models: {', '.join(f'{m}: {cost:,.0f}' for m, cost in f['models'].items())}")
         elif f["id"] == "images":
-            out.append(f"   Total images: {f['total_images']} | Sessions with 10+ images: {f['heavy_session_count']}")
+            out.append(f"   Total images: {f['total_images']:,} | Sessions with 10+ images: {f['heavy_session_count']}")
         out.append(f"   Fix: {f['fix']}\n")
 
     out.append(f"{b}CONFIG & EFFICIENCY FINDINGS:{r}")

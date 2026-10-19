@@ -84,7 +84,7 @@ class TestLimitDoctor(unittest.TestCase):
         self.assertIn("used_server", used_m)
 
         # Check images found in user messages
-        self.assertEqual(s_imgs.get("sess-test-1"), 1)
+        self.assertEqual(len(s_imgs.get("sess-test-1", [])), 1)
 
     def test_idle_rebuild_detection_both_tiers(self):
         """Test idle rebuild detection for 5m tier and 1h tier."""
@@ -107,6 +107,8 @@ class TestLimitDoctor(unittest.TestCase):
         # (msg_003: 1h tier, gap = 2 min < 3600s -> not rebuild)
         # 2. msg_004: 1h tier, gap = 67 min (4020s > 3600s), cache write = 25,000 > 20k -> rebuild!
         self.assertEqual(idle["count"], 2)
+        # only the premium over a warm read: 25k*(1.25-0.1) + 25k*(2.0-0.1)
+        self.assertAlmostEqual(idle["weighted_cost"], 76250.0)
 
     def test_unused_mcp_detection(self):
         """Test unused MCP servers identification across configs."""
@@ -128,7 +130,7 @@ class TestLimitDoctor(unittest.TestCase):
         # All others should be flagged as unused
         self.assertIn("unused_server_user", unused_names)
         self.assertIn("unused_settings_server", unused_names)
-        self.assertIn("unused_plugin", unused_names)
+        self.assertNotIn("unused_plugin", unused_names)  # plugins are not MCP servers
         self.assertIn("unused_codex_server", unused_names)
         self.assertIn("unused_proj_server", unused_names)
 
@@ -166,6 +168,17 @@ class TestLimitDoctor(unittest.TestCase):
         self.assertIn("session-1", md)  # Masked session id in markdown
         self.assertNotIn("sess-test-1", md)  # No raw session IDs in markdown
         self.assertNotIn("\u2014", md)  # No em dashes
+
+    def test_images_reset_at_compaction(self):
+        t0 = datetime(2026, 10, 19, 10, 0, tzinfo=timezone.utc)
+        at = lambda m: t0.replace(minute=m)
+        turns = [Turn("s1", at(m), "/x", False, "claude-opus-5-5", 0, 50000, 0, 0, 10, "f") for m in (1, 2, 4)]
+        events = {"s1": [(at(0), 1), (at(0), 1), (at(3), 0)]}  # two images, then a compaction
+        rep = analyze_usage(turns, events, set(), [], {}, {}, 7)
+        img = {f["id"]: f for f in rep["claude"]["cost_findings"]}["images"]
+        self.assertEqual(img["total_images"], 2)
+        # turns at :01 and :02 carry 2 images each, the turn after compaction carries none
+        self.assertAlmostEqual(img["weighted_cost"], 2 * 2 * 1600 * 0.1)
 
 
 if __name__ == "__main__":
