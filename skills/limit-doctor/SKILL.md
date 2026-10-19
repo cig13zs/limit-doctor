@@ -13,6 +13,7 @@ Diagnose why your usage limit is draining and get the exact fix for each cause.
    ```bash
    python limit_doctor.py --json
    ```
+   Use the copy of `limit_doctor.py` next to this SKILL.md, or the one in the repo clone.
 
 2. Parse the output JSON:
    - Identify the top 3 findings ranked by weighted token cost.

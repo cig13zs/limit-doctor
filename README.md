@@ -2,99 +2,65 @@
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/jju1s)
 
-limit-doctor is a lightweight, zero-dependency CLI that analyzes your local Claude Code and Codex session logs to diagnose what is draining your token limits. It pinpoints idle cache expirations, oversized contexts, unused MCP servers, and heavy session starts, giving you the single direct fix for each cause.
+Reads your local Claude Code and Codex logs and tells you where your usage went, ranked by cost, with the fix for each cause.
 
-## Install and Run
+I wrote it because my weekly limit kept running low and I could not tell why. My own last 7 days:
 
-Requires Python 3.10 or newer (Python standard library only).
+```text
+TOP FINDINGS (ranked by weighted token cost; a turn can count in several):
+1. Subagents and sidechains [ 63.9% | 301,893,863 weighted tokens]
+   Subagent turns: 9,916
+   Fix: cheaper models and tight briefs for mechanical subagent jobs.
+
+2. Context past 100k [ 33.4% | 157,962,809 weighted tokens]
+   Sessions with median context > 100k: 35 | Turns past 100k: 13,681
+   Fix: start a new session per task.
+
+3. Images kept in context (estimate) [  8.6% | 40,658,730 weighted tokens]
+   Total images: 5,286 | Sessions with 10+ images: 26
+
+4. Cache rebuilds after idle [  5.5% | 26,069,887 weighted tokens]
+   Count: 91 rebuilds
+
+Unused MCP servers (configured but 0 calls in window):
+  * ltspice (project (CLAUDE CODE OUTPUTS/School)) -> claude mcp remove ltspice -s project
+```
+
+Two thirds of it was subagents. I had no idea.
+
+## Run it
+
+Python 3.11 or newer, nothing to install.
 
 ```bash
-git clone https://github.com/jju1s/limit-doctor.git
+git clone https://github.com/cig13zs/limit-doctor
 cd limit-doctor
 python limit_doctor.py
 ```
 
-Optional flags:
-* `--days N`: analysis window in days (default: 7)
-* `--json`: print structured machine-readable JSON
-* `--md report.md`: export report to markdown
-* `--no-codex`: skip Codex logs
-* `--no-claude`: skip Claude logs
+`--days N` changes the window (default 7). `--json` prints the same findings for scripts, `--md report.md` writes a shareable report with session ids removed. `--no-codex` and `--no-claude` skip one side, and `--claude-dir` / `--codex-dir` point at non-default homes (it also reads `CLAUDE_CONFIG_DIR` and `CODEX_HOME`).
 
-## Sample Report
+### As a skill
 
-```text
-LIMIT DOCTOR v0.1
-Window: last 30 days | Cost model: API ratios (read 0.1x, 5m write 1.25x, 1h write 2.0x, out 5.0x)
-Percentages are shares of your own usage, not published plan limits.
---------------------------------------------------------------------------------
-CLAUDE CODE USAGE: 178,020 weighted tokens across 5 turns in 1 sessions
+Copy `skills/limit-doctor/` and `limit_doctor.py` into `~/.claude/skills/limit-doctor/` (or `~/.codex/skills/`), then ask your agent why your limit is draining. It runs the script, explains the top three findings and shows the fix commands. It won't remove anything unless you say so.
 
-TOP FINDINGS (ranked by weighted token cost):
-1. Cache rebuilds after idle [ 46.1% | 82,050 weighted tokens]
-   Count: 2 rebuilds
-   Worst sessions:
-     - sess-test-1...: 2 rebuilds (82,050 weighted tokens)
-   Fix: finish or /clear before stepping away; long breaks re-bill the whole context.
+## How it counts
 
-2. Heavy session start [ 24.8% | 44,150 weighted tokens]
-   First-turn cache write median: 35,000 [FLAGGED > 30k] | worst: 35,000
-   Fix: fewer always-on MCP servers and a shorter CLAUDE.md.
+Plans don't publish their limits, so the percentages are shares of your own usage. Tokens are weighted by API price ratios: an uncached input token is 1, a cache read 0.1, a 5-minute cache write 1.25, a 1-hour cache write 2, output 5. Codex gets its own section and is never added to the Claude total.
 
-3. Subagents and sidechains [  0.8% | 1,420 weighted tokens]
-   Subagent turns: 1
-   Models: claude-3-5-haiku-20241022: 1,420
-   Fix: limit autonomous subagent depth and review subagent task scope.
+What each finding measures:
 
-4. Long contexts (median context > 100k) [  0.0% | 0 weighted tokens]
-   Sessions with median context > 100k: 0 | Turns past 100k: 0
-   Fix: start a new session per task.
+- Cache rebuilds: a turn that rewrote over 20k tokens of cache after the cache had expired (5 minutes or an hour, depending on the tier). Only the premium over a warm read counts.
+- Heavy session start: the first turn's cache write, which is the system prompt, tools, CLAUDE.md and MCP schemas. Flagged when the median is over 30k.
+- Unused MCP servers: configured in `~/.claude.json`, `settings.json`, a project `.mcp.json` or `~/.codex/config.toml`, with no calls in the window.
+- Context past 100k: the part of each turn's context above 100k, re-read every turn.
+- Images: an estimate of 1,600 tokens per image, re-read on every later turn until the session compacts.
+- Subagents: everything run in subagent logs, split by model.
 
-5. Sessions with 10+ images [  0.0% | 0 weighted tokens]
-   Total images: 1 | Sessions with 10+ images: 0
-   Fix: crop or downscale screenshots; prefer text reads.
+## What it reads
 
-CONFIG & EFFICIENCY FINDINGS:
-Unused MCP servers (configured but 0 calls in window):
-  * unused_server_user (user) -> claude mcp remove unused_server_user -s user
-  * unused_proj_server (project (demo/proj1)) -> claude mcp remove unused_proj_server -s project
-  * unused_settings_server (settings) -> remove mcpServers.unused_settings_server in ~/.claude/settings.json
-  * unused_plugin (plugin) -> set enabledPlugins.unused_plugin to false in ~/.claude/settings.json
-  * unused_codex_server (codex) -> remove [mcp_servers.unused_codex_server] in ~/.codex/config.toml
-Model mix:
-  * claude-opus-5-5: 176,600 weighted tokens (99.2%)
-  * claude-3-5-haiku-20241022: 1,420 weighted tokens (0.8%)
-  Hint: most short turns (<200 output tokens) ran on claude-opus-5-5 (80.0%),
-  which is the most expensive model.
-
-BREAKDOWN:
-Projects (cwd):
-  demo/proj1                              5 turns       178,020 tokens (100.0%)
-Daily usage:
-  2026-10-19       5 turns       178,020 tokens (100.0%)
-Top 5 sessions:
-  sess-test-1...   2026-10-19  demo/proj1              5 turns     178,020 tokens (100.0%)
-
-CODEX (separate usage, not summed with Claude):
-Latest rate limits: 25.0% used (window: 10080m, resets at 2026-10-14 03:47 UTC)
-Daily tokens:
-  2026-10-19: 890 weighted tokens (cached input share: 40.0%)
-```
-
-## What It Reads
-
-limit-doctor operates in read-only mode on local paths:
-* `~/.claude/projects/` and `~/.claude/projects/*/subagents/` (Claude session jsonl logs)
-* `~/.codex/sessions/` (Codex rollout jsonl logs)
-* `~/.claude.json`, `~/.claude/settings.json`, and `.mcp.json` (MCP server registrations)
-* `~/.codex/config.toml` (Codex MCP configuration)
-
-It never modifies your logs or configs, and it never prints prompt or response text.
-
-## Privacy
-
-limit-doctor runs 100% locally on your computer. It makes no external network requests, collects no analytics, and sends nothing anywhere.
+`~/.claude/projects/` (session logs and subagent logs), `~/.codex/sessions/`, and the MCP config files listed above. It only reads. It prints counts, model names, paths and times, never prompt or response text, and it makes no network requests.
 
 ## License
 
-MIT (c) 2026 jju1s
+MIT
