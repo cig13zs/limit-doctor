@@ -6,11 +6,13 @@ Standard library only. Compatible with Python 3.10+.
 
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import statistics
+import sys
 import tomllib
 
 # Cost model relative to uncached input token:
@@ -150,6 +152,7 @@ def find_configured_mcp_servers(
     return cfgs
 
 
+
 def parse_claude_logs(
     claude_dir: Path, cutoff: datetime
 ) -> tuple[list[Turn], dict[str, int], set[str], set[str]]:
@@ -221,6 +224,60 @@ def parse_claude_logs(
         except Exception:
             continue
     return turns, session_images, used_mcps, cwds
+
+
+def parse_codex_logs(
+    codex_dir: Path, cutoff: datetime
+) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
+    daily: dict[str, dict[str, float]] = {}
+    latest_rl: dict[str, object] = {}
+    latest_ts = 0.0
+    s_dir = codex_dir / "sessions"
+    if not s_dir.is_dir():
+        return daily, latest_rl
+
+    cutoff_epoch = cutoff.timestamp() - 86400
+    for fp in s_dir.glob("**/*.jsonl"):
+        try:
+            if fp.stat().st_mtime < cutoff_epoch:
+                continue
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    ts = parse_iso_ts(d.get("timestamp"))
+                    if not ts or ts < cutoff:
+                        continue
+                    payload = d.get("payload")
+                    if isinstance(payload, dict) and payload.get("type") == "token_count":
+                        info = payload.get("info")
+                        if not isinstance(info, dict):
+                            continue
+                        last_u = info.get("last_token_usage")
+                        if isinstance(last_u, dict):
+                            in_tok = last_u.get("input_tokens", 0) or 0
+                            c_tok = last_u.get("cached_input_tokens", 0) or 0
+                            o_tok = last_u.get("output_tokens", 0) or 0
+                            w = max(0, in_tok - c_tok) * 1.0 + c_tok * 0.1 + o_tok * 5.0
+                            d_str = ts.strftime("%Y-%m-%d")
+                            de = daily.setdefault(d_str, {"weighted": 0.0, "input": 0.0, "cached": 0.0, "output": 0.0})
+                            de["weighted"] += w
+                            de["input"] += in_tok
+                            de["cached"] += c_tok
+                            de["output"] += o_tok
+
+                        rl = payload.get("rate_limits")
+                        if isinstance(rl, dict) and isinstance(rl.get("primary"), dict):
+                            if ts.timestamp() > latest_ts:
+                                latest_ts = ts.timestamp()
+                                latest_rl = rl["primary"]
+        except Exception:
+            continue
+    return daily, latest_rl
 
 
 def analyze_usage(
@@ -323,6 +380,7 @@ def analyze_usage(
          "fix": "crop or downscale screenshots; prefer text reads."},
     ], key=lambda x: x["weighted_cost"], reverse=True)
 
+    # Breakdowns
     pb: dict[str, dict[str, float]] = {}
     db: dict[str, dict[str, float]] = {}
     for t in turns:
@@ -363,3 +421,177 @@ def analyze_usage(
             "rate_limits": codex_rl,
         },
     }
+
+
+def format_text(data: dict[str, object], is_tty: bool) -> str:
+    b = "\033[1m" if is_tty else ""
+    c = "\033[36m" if is_tty else ""
+    r = "\033[0m" if is_tty else ""
+    claude = data.get("claude", {})
+    tot = claude.get("total_weighted_tokens", 0.0)
+
+    out = [
+        f"{b}LIMIT DOCTOR v0.1{r}",
+        f"Window: last {data['window_days']} days | Cost model: API ratios (read 0.1x, 5m write 1.25x, 1h write 2.0x, out 5.0x)",
+        "Percentages are shares of your own usage, not published plan limits.",
+        "-" * 80,
+        f"{b}CLAUDE CODE USAGE:{r} {tot:,.0f} weighted tokens across {claude.get('total_turns', 0):,} turns in {claude.get('total_sessions', 0):,} sessions\n",
+        f"{b}TOP FINDINGS (ranked by weighted token cost):{r}"
+    ]
+
+    for idx, f in enumerate(claude.get("cost_findings", []), 1):
+        out.append(f"{c}{idx}. {f['name']}{r} [{f['share_pct']:5.1f}% | {f['weighted_cost']:,.0f} weighted tokens]")
+        if f["id"] == "idle_rebuilds":
+            out.append(f"   Count: {f['count']} rebuilds")
+            worst = f.get("worst_sessions", [])
+            if worst:
+                out.append("   Worst sessions:")
+                for sid, sd in worst[:3]:
+                    out.append(f"     - {sid[:12]}...: {int(sd['count'])} rebuilds ({sd['cost']:,.0f} weighted tokens)")
+        elif f["id"] == "long_contexts":
+            out.append(f"   Sessions with median context > 100k: {f['session_count']} | Turns past 100k: {f['turns_past_100k_count']:,}")
+        elif f["id"] == "heavy_session_start":
+            st = " [FLAGGED > 30k]" if f.get("flagged") else ""
+            out.append(f"   First-turn cache write median: {f['median_write']:,.0f}{st} | worst: {f['worst_write']:,.0f}")
+        elif f["id"] == "subagents":
+            out.append(f"   Subagent turns: {f['turn_count']}")
+            if f.get("models"):
+                out.append(f"   Models: {', '.join(f'{m}: {cost:,.0f}' for m, cost in f['models'].items())}")
+        elif f["id"] == "images":
+            out.append(f"   Total images: {f['total_images']} | Sessions with 10+ images: {f['heavy_session_count']}")
+        out.append(f"   Fix: {f['fix']}\n")
+
+    out.append(f"{b}CONFIG & EFFICIENCY FINDINGS:{r}")
+    unused = claude.get("unused_mcps", [])
+    if unused:
+        out.append("Unused MCP servers (configured but 0 calls in window):")
+        for u in unused:
+            out.append(f"  * {u['server']} ({u['scope']}) -> {u['command']}")
+    else:
+        out.append("Unused MCP servers: None detected.")
+
+    out.append("Model mix:")
+    for m, md in claude.get("models", {}).items():
+        out.append(f"  * {m}: {md['cost']:,.0f} weighted tokens ({md['share_pct']:.1f}%)")
+    sh = claude.get("model_short_turns", {})
+    if sh.get("flagged"):
+        out.append(f"  Hint: most short turns (<200 output tokens) ran on {sh['most_expensive_model']} ({sh['exp_model_short_share_pct']:.1f}%),\n  which is the most expensive model.")
+    out.append("")
+
+    bd = claude.get("breakdown", {})
+    out.append(f"{b}BREAKDOWN:{r}\nProjects (cwd):")
+    for p in bd.get("projects", [])[:5]:
+        out.append(f"  {p['project']:<35} {p['turns']:>5} turns  {p['cost']:>12,.0f} tokens ({p['share_pct']:5.1f}%)")
+    out.append("Daily usage:")
+    for d in bd.get("daily", []):
+        out.append(f"  {d['date']:<12} {d['turns']:>5} turns  {d['cost']:>12,.0f} tokens ({d['share_pct']:5.1f}%)")
+    out.append("Top 5 sessions:")
+    for s in bd.get("top_sessions", []):
+        sid = s["session_id"][:12] + "..."
+        out.append(f"  {sid:<16} {s['date']}  {s['project']:<20} {s['turns']:>4} turns  {s['weighted_cost']:>10,.0f} tokens ({s['share_pct']:5.1f}%)")
+    out.append("")
+
+    codex = data.get("codex", {})
+    out.append(f"{b}CODEX (separate usage, not summed with Claude):{r}")
+    rl = codex.get("rate_limits")
+    if isinstance(rl, dict) and rl.get("used_percent") is not None:
+        rst = rl.get("resets_at")
+        rst_s = datetime.fromtimestamp(rst, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if isinstance(rst, (int, float)) else "unknown"
+        out.append(f"Latest rate limits: {rl.get('used_percent')}% used (window: {rl.get('window_minutes')}m, resets at {rst_s})")
+    cd = codex.get("daily", [])
+    if cd:
+        out.append("Daily tokens:")
+        for c_entry in cd:
+            out.append(f"  {c_entry['date']}: {c_entry['weighted_tokens']:,.0f} weighted tokens (cached input share: {c_entry['cached_share_pct']:.1f}%)")
+    else:
+        out.append("No Codex token usage recorded in window.")
+
+    return "\n".join(out)
+
+
+def format_markdown(data: dict[str, object]) -> str:
+    claude = data.get("claude", {})
+    tot = claude.get("total_weighted_tokens", 0.0)
+    lines = [
+        "# Limit Doctor Report",
+        f"Window: last {data['window_days']} days. Cost model mirrors API price ratios (input 1.0, 5m write 1.25, 1h write 2.0, read 0.1, output 5.0). Percentages represent shares of internal usage.\n",
+        f"## Claude Code Usage: {tot:,.0f} weighted tokens\n",
+        "### Findings Ranked by Weighted Cost\n",
+        "| Rank | Finding | Share | Weighted Tokens | Fix |\n| --- | --- | --- | --- | --- |"
+    ]
+    for idx, f in enumerate(claude.get("cost_findings", []), 1):
+        lines.append(f"| {idx} | {f['name']} | {f['share_pct']:.1f}% | {f['weighted_cost']:,.0f} | {f['fix']} |")
+    unused = claude.get("unused_mcps", [])
+    u_str = "\n".join(f"- `{u['server']}` ({u['scope']}): `{u['command']}`" for u in unused) if unused else "None detected."
+    lines.extend(["\n### Unused MCP Servers", u_str, "\n### Model Mix"])
+    for m, md in claude.get("models", {}).items():
+        lines.append(f"- `{m}`: {md['cost']:,.0f} weighted tokens ({md['share_pct']:.1f}%)")
+    sh = claude.get("model_short_turns", {})
+    if sh.get("flagged"):
+        lines.append(f"\nHint: most short turns (<200 output tokens) ran on `{sh['most_expensive_model']}` ({sh['exp_model_short_share_pct']:.1f}%), which is the most expensive model.")
+
+    bd = claude.get("breakdown", {})
+    lines.append("\n### Projects Breakdown\n| Project | Turns | Weighted Tokens | Share |\n| --- | --- | --- | --- |")
+    for p in bd.get("projects", []):
+        lines.append(f"| {p['project']} | {p['turns']} | {p['cost']:,.0f} | {p['share_pct']:.1f}% |")
+
+    lines.append("\n### Top Sessions\n| Session | Date | Project | Turns | Weighted Tokens | Share |\n| --- | --- | --- | --- | --- | --- |")
+    for idx, s in enumerate(bd.get("top_sessions", []), 1):
+        lines.append(f"| session-{idx} | {s['date']} | {s['project']} | {s['turns']} | {s['weighted_cost']:,.0f} | {s['share_pct']:.1f}% |")
+
+    codex = data.get("codex", {})
+    lines.append("\n## Codex Usage")
+    rl = codex.get("rate_limits")
+    if isinstance(rl, dict) and rl.get("used_percent") is not None:
+        rst = rl.get("resets_at")
+        rst_s = datetime.fromtimestamp(rst, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if isinstance(rst, (int, float)) else "unknown"
+        lines.append(f"- Rate limits: {rl.get('used_percent')}% used (window: {rl.get('window_minutes')}m, resets at {rst_s})")
+    for c_entry in codex.get("daily", []):
+        lines.append(f"- {c_entry['date']}: {c_entry['weighted_tokens']:,.0f} weighted tokens (cached input share: {c_entry['cached_share_pct']:.1f}%)")
+    return "\n".join(lines)
+
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="limit_doctor", description="Diagnose token usage drains and report actionable fixes.")
+    for flag, kw in [
+        ("--days", {"type": int, "default": 7, "help": "Window in days"}),
+        ("--json", {"action": "store_true", "help": "Machine output"}),
+        ("--md", {"type": str, "default": "", "help": "Markdown output file"}),
+        ("--claude-dir", {"type": str, "default": "", "help": "Claude config dir"}),
+        ("--codex-dir", {"type": str, "default": "", "help": "Codex config dir"}),
+        ("--no-claude", {"action": "store_true", "help": "Skip Claude"}),
+        ("--no-codex", {"action": "store_true", "help": "Skip Codex"}),
+    ]:
+        p.add_argument(flag, **kw)
+    args = p.parse_args(argv)
+
+    c_dir = Path(args.claude_dir or os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    cx_dir = Path(args.codex_dir or os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    cj_path = Path.home() / ".claude.json"
+    for cand in (c_dir.parent / ".claude.json", c_dir.parent / "claude.json", c_dir / "claude.json"):
+        if cand.is_file():
+            cj_path = cand
+            break
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+
+    turns, s_imgs, used_m, cwds = parse_claude_logs(c_dir, cutoff) if not args.no_claude else ([], {}, set(), set())
+    cfg_m = find_configured_mcp_servers(c_dir, cj_path, cx_dir, cwds) if not args.no_claude else []
+    cx_daily, cx_rl = parse_codex_logs(cx_dir, cutoff) if not args.no_codex else ({}, {})
+    rep = analyze_usage(turns, s_imgs, used_m, cfg_m, cx_daily, cx_rl, args.days)
+
+    if args.json:
+        print(json.dumps(rep, indent=2))
+    else:
+        print(format_text(rep, is_tty=sys.stdout.isatty()))
+    if args.md:
+        try:
+            Path(args.md).write_text(format_markdown(rep), encoding="utf-8")
+        except Exception as e:
+            sys.stderr.write(f"Warning: failed to write markdown to {args.md}: {e}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
