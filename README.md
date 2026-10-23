@@ -52,7 +52,11 @@ python limit_doctor.py
 
 ### As a skill
 
-Copy `skills/limit-doctor/` and `limit_doctor.py` into `~/.claude/skills/limit-doctor/` (or `~/.codex/skills/`), then ask your agent why your limit is draining. It runs the script, explains the top three findings and shows the fix commands. It won't remove anything unless you say so.
+```bash
+npx skills add cig13zs/limit-doctor
+```
+
+That installs the skill for Claude Code, Codex or any other agent you pick, with the script inside it. Without Node, copy `skills/limit-doctor/` into `~/.claude/skills/` (or `~/.codex/skills/`). Then ask your agent why your limit is draining. It runs the script, explains the top three findings and shows the fix commands. It won't remove anything unless you say so.
 
 ## How it counts
 
