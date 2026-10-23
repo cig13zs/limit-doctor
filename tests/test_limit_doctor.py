@@ -6,10 +6,13 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
-from limit_doctor import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "limit-doctor"))
+
+from limit_doctor import (  # noqa: E402
     Turn,
     analyze_usage,
     count_image_blocks,
