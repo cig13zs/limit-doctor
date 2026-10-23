@@ -53,6 +53,48 @@ def parse_since(value: str, now: datetime | None = None) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def local_day(ts: datetime) -> str:
+    """Calendar day in the user's own time zone, so a day matches the user's own idea of a day."""
+    return ts.astimezone().strftime("%Y-%m-%d")
+
+
+def day_rows(entries: list[dict[str, object]], key: str) -> list[dict[str, object]]:
+    """Daily entries with the empty days between the first and last active day filled in."""
+    if not entries:
+        return []
+    by_date = {e["date"]: e for e in entries}
+    first = datetime.strptime(min(by_date), "%Y-%m-%d")
+    last = datetime.strptime(max(by_date), "%Y-%m-%d")
+    rows = []
+    d = first
+    while d <= last:
+        ds = d.strftime("%Y-%m-%d")
+        rows.append(by_date.get(ds) or {"date": ds, key: 0.0, "turns": 0})
+        d += timedelta(days=1)
+    return rows
+
+
+def trend_lines(entries: list[dict[str, object]], key: str, width: int = 20) -> list[str]:
+    """One bar per day, scaled to the busiest day, then the busiest day against the average."""
+    rows = day_rows(entries, key)
+    if not rows:
+        return []
+    top = max(r[key] for r in rows) or 1.0
+    total = sum(r[key] for r in rows) or 1.0
+    out = []
+    for r in rows:
+        bar = "#" * max(1 if r[key] > 0 else 0, round(r[key] / top * width))
+        day = datetime.strptime(r["date"], "%Y-%m-%d").strftime("%a")
+        turns = f"  {r['turns']:>6,} turns" if "turns" in r and key == "cost" else ""
+        out.append(f"  {r['date']} {day}  {bar:<{width}}  {r[key]:>13,.0f} ({r[key] / total * 100:5.1f}%){turns}")
+    active = [r for r in rows if r[key] > 0]
+    if len(active) > 1:
+        avg = sum(r[key] for r in active) / len(active)
+        busiest = max(active, key=lambda r: r[key])
+        out.append(f"  Busiest: {busiest['date']}, {busiest[key] / avg:.1f}x the average active day ({avg:,.0f}).")
+    return out
+
+
 def shorten_cwd(cwd: str | None) -> str:
     if not cwd:
         return "unknown"
@@ -321,7 +363,7 @@ def parse_codex_logs(
                             c_tok = last_u.get("cached_input_tokens", 0) or 0
                             o_tok = last_u.get("output_tokens", 0) or 0
                             w = max(0, in_tok - c_tok) * 1.0 + c_tok * 0.1 + o_tok * 5.0
-                            d_str = ts.strftime("%Y-%m-%d")
+                            d_str = local_day(ts)
                             de = daily.setdefault(d_str, {"weighted": 0.0, "input": 0.0, "cached": 0.0, "output": 0.0})
                             de["weighted"] += w
                             de["input"] += in_tok
@@ -480,13 +522,13 @@ def analyze_usage(
         pe["turns"] += 1
         pe["cost"] += t.weighted_cost
 
-        d_str = t.timestamp.strftime("%Y-%m-%d")
+        d_str = local_day(t.timestamp)
         de = db.setdefault(d_str, {"turns": 0, "cost": 0.0})
         de["turns"] += 1
         de["cost"] += t.weighted_cost
 
     top_s = sorted([
-        {"session_id": sid, "date": st[0].timestamp.strftime("%Y-%m-%d"), "project": shorten_cwd(max(set(t.cwd for t in st), key=[t.cwd for t in st].count)),
+        {"session_id": sid, "date": local_day(st[0].timestamp), "project": shorten_cwd(max(set(t.cwd for t in st), key=[t.cwd for t in st].count)),
          "turns": len(st), "weighted_cost": sum(t.weighted_cost for t in st), "share_pct": share(sum(t.weighted_cost for t in st))}
         for sid, st in sessions.items()
     ], key=lambda x: x["weighted_cost"], reverse=True)[:5]
@@ -581,9 +623,8 @@ def format_text(data: dict[str, object], is_tty: bool) -> str:
     out.append(f"{b}BREAKDOWN:{r}\nProjects (cwd):")
     for p in bd.get("projects", [])[:5]:
         out.append(f"  {p['project']:<35} {p['turns']:>5} turns  {p['cost']:>12,.0f} tokens ({p['share_pct']:5.1f}%)")
-    out.append("Daily usage:")
-    for d in bd.get("daily", []):
-        out.append(f"  {d['date']:<12} {d['turns']:>5} turns  {d['cost']:>12,.0f} tokens ({d['share_pct']:5.1f}%)")
+    out.append("Daily usage (weighted tokens, your local days):")
+    out.extend(trend_lines(bd.get("daily", []), "cost"))
     out.append("Top 5 sessions:")
     for s in bd.get("top_sessions", []):
         sid = s["session_id"][:12] + "..."
@@ -595,9 +636,10 @@ def format_text(data: dict[str, object], is_tty: bool) -> str:
     out.extend(rate_limit_lines(codex))
     cd = codex.get("daily", [])
     if cd:
-        out.append("Daily tokens:")
-        for c_entry in cd:
-            out.append(f"  {c_entry['date']}: {c_entry['weighted_tokens']:,.0f} weighted tokens (cached input share: {c_entry['cached_share_pct']:.1f}%)")
+        out.append("Daily usage (weighted tokens, your local days):")
+        out.extend(trend_lines(cd, "weighted_tokens"))
+        cached = sum(e["cached_tokens"] for e in cd) / (sum(e["input_tokens"] for e in cd) or 1) * 100
+        out.append(f"  Cached share of input over the window: {cached:.1f}%")
     else:
         out.append("No Codex token usage recorded in window.")
 
@@ -629,6 +671,10 @@ def format_markdown(data: dict[str, object]) -> str:
     lines.append("\n### Projects Breakdown\n| Project | Turns | Weighted Tokens | Share |\n| --- | --- | --- | --- |")
     for p in bd.get("projects", []):
         lines.append(f"| {p['project']} | {p['turns']} | {p['cost']:,.0f} | {p['share_pct']:.1f}% |")
+
+    lines.append("\n### Daily Usage\n| Day | Turns | Weighted Tokens | Share |\n| --- | --- | --- | --- |")
+    for d in day_rows(bd.get("daily", []), "cost"):
+        lines.append(f"| {d['date']} | {d['turns']} | {d['cost']:,.0f} | {d['cost'] / (tot or 1) * 100:.1f}% |")
 
     lines.append("\n### Top Sessions\n| Session | Date | Project | Turns | Weighted Tokens | Share |\n| --- | --- | --- | --- | --- | --- |")
     for idx, s in enumerate(bd.get("top_sessions", []), 1):

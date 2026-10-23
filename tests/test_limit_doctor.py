@@ -13,6 +13,8 @@ from limit_doctor import (
     Turn,
     analyze_usage,
     count_image_blocks,
+    day_rows,
+    trend_lines,
     extract_mcp_servers_from_content,
     find_configured_mcp_servers,
     format_markdown,
@@ -254,6 +256,28 @@ class TestLimitDoctor(unittest.TestCase):
         with redirect_stdout(out):
             main(args[:-1] + ["--since", "2026-10-19T10:05:00Z"])
         self.assertIn("Window: since 2026-10-19 10:05 UTC", out.getvalue())
+
+    def test_daily_trend_fills_gaps_and_scales_bars(self):
+        noon = lambda d: datetime(2026, 10, d, 12, 0, tzinfo=timezone.utc)
+        # output-only turns: weighted cost = 5 x output tokens
+        turns = [Turn("s1", noon(17), "/x", False, "m", 0, 0, 0, 0, 1000, "f"),
+                 Turn("s2", noon(19), "/x", False, "m", 0, 0, 0, 0, 3000, "f"),
+                 Turn("s2", noon(19).replace(hour=13), "/x", False, "m", 0, 0, 0, 0, 1000, "f")]
+        rep = analyze_usage(turns, {}, set(), [], {}, {}, 7)
+        daily = rep["claude"]["breakdown"]["daily"]
+        self.assertEqual([d["date"] for d in daily], ["2026-10-17", "2026-10-19"])
+        rows = day_rows(daily, "cost")
+        self.assertEqual([(r["date"], r["cost"]) for r in rows], [("2026-10-17", 5000.0), ("2026-10-18", 0.0), ("2026-10-19", 20000.0)])
+        lines = trend_lines(daily, "cost", width=20)
+        self.assertEqual(lines[0], "  2026-10-17 Sat  #####                         5,000 ( 20.0%)       1 turns")
+        self.assertEqual(lines[1], "  2026-10-18 Sun                                    0 (  0.0%)       0 turns")
+        self.assertTrue(lines[2].startswith("  2026-10-19 Mon  " + "#" * 20))
+        self.assertEqual(lines[3], "  Busiest: 2026-10-19, 1.6x the average active day (12,500).")
+        self.assertTrue(all(len(line) <= 80 for line in lines))
+        text = format_text(rep, is_tty=False)
+        self.assertIn("Daily usage (weighted tokens, your local days):", text)
+        self.assertIn("| 2026-10-18 | 0 | 0 | 0.0% |", format_markdown(rep))
+        self.assertEqual(trend_lines([], "cost"), [])
 
 
 if __name__ == "__main__":
