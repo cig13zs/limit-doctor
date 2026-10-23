@@ -28,6 +28,16 @@ Unused MCP servers (configured but 0 calls in window):
 
 Two thirds of it was subagents. I had no idea.
 
+After the findings come the projects, a bar per day and the top sessions:
+
+```text
+Daily usage (weighted tokens, your local days):
+  2026-10-17 Sat  #####                         5,000 ( 20.0%)       1 turns
+  2026-10-18 Sun                                    0 (  0.0%)       0 turns
+  2026-10-19 Mon  ####################         20,000 ( 80.0%)       2 turns
+  Busiest: 2026-10-19, 1.6x the average active day (12,500).
+```
+
 ## Run it
 
 Python 3.11 or newer, nothing to install.

@@ -4,6 +4,7 @@
 
 ### Added
 
+- The daily breakdown is now a bar chart in the text report, one row per day including empty days, with the busiest day against the average. Codex gets the same chart. Days follow your local time zone instead of UTC, and `--md` reports gain a daily table.
 - `--since` starts the window at a point instead of `--days`: relative (`5h`, `2d`, `90m`, `1w`) or a date or time in your local zone (`2026-10-20`, `"2026-10-20 08:00"`). The report header and `--json` (`since`) show the start. The skill uses it when you ask about a specific stretch, such as since your limit last reset.
 
 ### Fixed
