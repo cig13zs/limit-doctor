@@ -1,6 +1,9 @@
 """Unit tests for limit-doctor."""
 
-from datetime import datetime, timezone
+import argparse
+from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -15,7 +18,9 @@ from limit_doctor import (
     format_markdown,
     format_text,
     model_expense_tier,
+    main,
     normalize_rate_limits,
+    parse_since,
     parse_claude_logs,
     parse_codex_logs,
     parse_iso_ts,
@@ -219,6 +224,36 @@ class TestLimitDoctor(unittest.TestCase):
         self.assertIn("5-hour window: 30.0% used, resets 2026-10-19 12:10 UTC", text)
         self.assertIn("weekly window: 75.5% used, resets 2026-10-20 12:00 UTC", text)
         self.assertIn("- weekly window: 75.5% used", format_markdown(rep))
+
+    def test_parse_since(self):
+        now = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(parse_since("5h", now), now - timedelta(hours=5))
+        self.assertEqual(parse_since("2d", now), now - timedelta(days=2))
+        self.assertEqual(parse_since("90m", now), now - timedelta(minutes=90))
+        self.assertEqual(parse_since("1w", now), now - timedelta(weeks=1))
+        self.assertEqual(parse_since("1.5h", now), now - timedelta(minutes=90))
+        self.assertEqual(parse_since("2026-10-19T08:00Z", now), datetime(2026, 10, 19, 8, 0, tzinfo=timezone.utc))
+        self.assertEqual(parse_since("2026-10-19 08:00+02:00", now), datetime(2026, 10, 19, 6, 0, tzinfo=timezone.utc))
+        local_midnight = datetime(2026, 10, 19).astimezone().astimezone(timezone.utc)
+        self.assertEqual(parse_since("2026-10-19", now), local_midnight)
+        for bad in ("yesterday", "5x", "h", "", "2026-10-21"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                parse_since(bad, now)
+
+    def test_since_limits_the_window(self):
+        args = ["--claude-dir", str(self.claude_dir), "--codex-dir", str(self.codex_dir), "--json"]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main(args + ["--since", "2026-10-19T10:05:00Z"])
+        rep = json.loads(out.getvalue())
+        # msg_001 (10:00) and the subagent turn (10:02) fall before the cut
+        self.assertEqual(rep["claude"]["total_turns"], 3)
+        self.assertEqual(rep["since"], "2026-10-19T10:05:00+00:00")
+        self.assertEqual(rep["codex"]["daily"][0]["date"], "2026-10-19")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            main(args[:-1] + ["--since", "2026-10-19T10:05:00Z"])
+        self.assertIn("Window: since 2026-10-19 10:05 UTC", out.getvalue())
 
 
 if __name__ == "__main__":
