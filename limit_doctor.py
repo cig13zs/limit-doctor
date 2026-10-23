@@ -231,6 +231,42 @@ def parse_claude_logs(
     return turns, session_images, used_mcps, cwds
 
 
+def normalize_rate_limits(rl: object, ts: datetime) -> list[dict[str, object]]:
+    """Codex rate-limit snapshot -> list of windows, across the log formats Codex has written.
+
+    Nested `primary`/`secondary` with `resets_at` (unix seconds) or `resets_in_seconds`,
+    and the early flat `primary_used_percent`/`secondary_window_minutes` form.
+    """
+    if not isinstance(rl, dict):
+        return []
+    windows = []
+    for name in ("primary", "secondary"):
+        w = rl.get(name)
+        if not isinstance(w, dict):
+            w = {"used_percent": rl.get(f"{name}_used_percent"), "window_minutes": rl.get(f"{name}_window_minutes")}
+        used = w.get("used_percent")
+        if not isinstance(used, (int, float)):
+            continue
+        resets_at = w.get("resets_at")
+        if not isinstance(resets_at, (int, float)) and isinstance(w.get("resets_in_seconds"), (int, float)):
+            resets_at = ts.timestamp() + w["resets_in_seconds"]
+        windows.append({"name": name, "used_percent": float(used), "window_minutes": w.get("window_minutes"),
+                        "resets_at": resets_at if isinstance(resets_at, (int, float)) else None})
+    return windows
+
+
+def window_label(minutes: object) -> str:
+    if not isinstance(minutes, (int, float)) or minutes <= 0:
+        return "unknown window"
+    if minutes == 10080:
+        return "weekly window"
+    if minutes % 1440 == 0:
+        return f"{int(minutes // 1440)}-day window"
+    if minutes % 60 == 0:
+        return f"{int(minutes // 60)}-hour window"
+    return f"{int(minutes)}-minute window"
+
+
 def parse_codex_logs(
     codex_dir: Path, cutoff: datetime
 ) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
@@ -275,14 +311,36 @@ def parse_codex_logs(
                             de["cached"] += c_tok
                             de["output"] += o_tok
 
-                        rl = payload.get("rate_limits")
-                        if isinstance(rl, dict) and isinstance(rl.get("primary"), dict):
-                            if ts.timestamp() > latest_ts:
-                                latest_ts = ts.timestamp()
-                                latest_rl = rl["primary"]
+                        windows = normalize_rate_limits(payload.get("rate_limits"), ts)
+                        if windows and ts.timestamp() > latest_ts:
+                            latest_ts = ts.timestamp()
+                            latest_rl = {"as_of": ts.timestamp(), "windows": windows}
         except Exception:
             continue
     return daily, latest_rl
+
+
+def primary_window(codex_rl: object) -> dict[str, object]:
+    """The first window in the v0.1 `rate_limits` shape, kept for scripts that read it."""
+    windows = codex_rl.get("windows", []) if isinstance(codex_rl, dict) else []
+    if not windows:
+        return {}
+    w = windows[0]
+    return {"used_percent": w["used_percent"], "window_minutes": w["window_minutes"], "resets_at": w["resets_at"]}
+
+
+def fmt_utc(epoch: object) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if isinstance(epoch, (int, float)) else "unknown"
+
+
+def rate_limit_lines(codex: dict[str, object]) -> list[str]:
+    windows = codex.get("rate_limit_windows") or []
+    if not windows:
+        return []
+    lines = [f"Latest rate limits (logged {fmt_utc(codex.get('rate_limits_as_of'))}):"]
+    for w in windows:
+        lines.append(f"  {window_label(w.get('window_minutes'))}: {w['used_percent']:.1f}% used, resets {fmt_utc(w.get('resets_at'))}")
+    return lines
 
 
 def analyze_usage(
@@ -434,7 +492,9 @@ def analyze_usage(
             "daily": sorted([{"date": k, "weighted_tokens": v["weighted"], "input_tokens": v["input"], "cached_tokens": v["cached"],
                               "cached_share_pct": (v["cached"] / v["input"] * 100.0) if v["input"] > 0 else 0.0}
                              for k, v in codex_daily.items()], key=lambda x: x["date"]),
-            "rate_limits": codex_rl,
+            "rate_limits": primary_window(codex_rl),
+            "rate_limit_windows": codex_rl.get("windows", []) if isinstance(codex_rl, dict) else [],
+            "rate_limits_as_of": codex_rl.get("as_of") if isinstance(codex_rl, dict) else None,
         },
     }
 
@@ -509,11 +569,7 @@ def format_text(data: dict[str, object], is_tty: bool) -> str:
 
     codex = data.get("codex", {})
     out.append(f"{b}CODEX (separate usage, not summed with Claude):{r}")
-    rl = codex.get("rate_limits")
-    if isinstance(rl, dict) and rl.get("used_percent") is not None:
-        rst = rl.get("resets_at")
-        rst_s = datetime.fromtimestamp(rst, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if isinstance(rst, (int, float)) else "unknown"
-        out.append(f"Latest rate limits: {rl.get('used_percent')}% used (window: {rl.get('window_minutes')}m, resets at {rst_s})")
+    out.extend(rate_limit_lines(codex))
     cd = codex.get("daily", [])
     if cd:
         out.append("Daily tokens:")
@@ -557,11 +613,10 @@ def format_markdown(data: dict[str, object]) -> str:
 
     codex = data.get("codex", {})
     lines.append("\n## Codex Usage")
-    rl = codex.get("rate_limits")
-    if isinstance(rl, dict) and rl.get("used_percent") is not None:
-        rst = rl.get("resets_at")
-        rst_s = datetime.fromtimestamp(rst, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if isinstance(rst, (int, float)) else "unknown"
-        lines.append(f"- Rate limits: {rl.get('used_percent')}% used (window: {rl.get('window_minutes')}m, resets at {rst_s})")
+    rl_lines = rate_limit_lines(codex)
+    if rl_lines:
+        lines.append(rl_lines[0])
+        lines.extend(f"- {line.strip()}" for line in rl_lines[1:])
     for c_entry in codex.get("daily", []):
         lines.append(f"- {c_entry['date']}: {c_entry['weighted_tokens']:,.0f} weighted tokens (cached input share: {c_entry['cached_share_pct']:.1f}%)")
     return "\n".join(lines)
