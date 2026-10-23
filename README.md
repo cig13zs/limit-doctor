@@ -1,6 +1,8 @@
 # limit-doctor
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/jju1s)
+[![Tests](https://img.shields.io/github/actions/workflow/status/cig13zs/limit-doctor/test.yml?label=tests)](https://github.com/cig13zs/limit-doctor/actions)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Reads your local Claude Code and Codex logs and tells you where your usage went, ranked by cost, with the fix for each cause.
 
@@ -60,6 +62,10 @@ What each finding measures:
 ## What it reads
 
 `~/.claude/projects/` (session logs and subagent logs), `~/.codex/sessions/`, and the MCP config files listed above. It only reads. It prints counts, model names, paths and times, never prompt or response text, and it makes no network requests.
+
+## Development
+
+`python -m unittest discover -s tests` runs the tests against the sample logs in `tests/fixtures/`. CI runs them on Python 3.11 to 3.14.
 
 ## License
 
