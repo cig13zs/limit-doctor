@@ -56,6 +56,7 @@ What each finding measures:
 - Context past 100k: the part of each turn's context above 100k, re-read every turn.
 - Images: an estimate of 1,600 tokens per image, re-read on every later turn until the session compacts.
 - Subagents: everything run in subagent logs, split by model.
+- Codex: weighted tokens per day, the cached share of input, and the latest reading of every rate-limit window Codex logs (the 5-hour one and the weekly one), with reset times. Older Codex versions logged these in other shapes; those are read too.
 
 ## What it reads
 

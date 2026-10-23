@@ -1,0 +1,11 @@
+# Changelog
+
+## Unreleased
+
+### Fixed
+
+- Codex: only the first rate-limit window was read, so the weekly limit never showed. The report now lists every window in the latest snapshot (5-hour and weekly) with its reset time. It also reads `resets_in_seconds` and the early flat `primary_used_percent` format. In `--json`, `codex.rate_limit_windows` holds the full list; `codex.rate_limits` keeps its v0.1 shape.
+
+## v0.1 (2026-10-20)
+
+First release: ranks Claude Code usage by weighted token cost (idle cache rebuilds, heavy session starts, context past 100k, images, subagents), lists unused MCP servers with the command to remove each, and adds a separate Codex section. Text, `--json` and `--md` output.
