@@ -40,7 +40,7 @@ cd limit-doctor
 python limit_doctor.py
 ```
 
-`--days N` changes the window (default 7). `--json` prints the same findings for scripts, `--md report.md` writes a shareable report with session ids removed. `--no-codex` and `--no-claude` skip one side, and `--claude-dir` / `--codex-dir` point at non-default homes (it also reads `CLAUDE_CONFIG_DIR` and `CODEX_HOME`).
+`--days N` changes the window (default 7). `--since` starts it at a point instead: `--since 5h` for the current 5-hour window, `--since 2d`, `--since 1w`, or a date or time such as `--since 2026-10-20` or `--since "2026-10-20 08:00"` (read as your local time). It answers "what used my limit since it last reset". `--json` prints the same findings for scripts, `--md report.md` writes a shareable report with session ids removed. `--no-codex` and `--no-claude` skip one side, and `--claude-dir` / `--codex-dir` point at non-default homes (it also reads `CLAUDE_CONFIG_DIR` and `CODEX_HOME`).
 
 ### As a skill
 

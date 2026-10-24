@@ -14,6 +14,8 @@ Diagnose why your usage limit is draining and get the exact fix for each cause.
    python limit_doctor.py --json
    ```
    Use the copy of `limit_doctor.py` next to this SKILL.md, or the one in the repo clone.
+   If the user asks about a specific stretch ("since my limit reset", "today", "this 5-hour window"),
+   add `--since` with a relative value (`5h`, `1d`, `1w`) or a local date/time (`2026-10-20 08:00`).
 
 2. Parse the output JSON:
    - Identify the top 3 findings ranked by weighted token cost.

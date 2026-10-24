@@ -36,6 +36,23 @@ def parse_iso_ts(ts_str: str | None) -> datetime | None:
         return None
 
 
+def parse_since(value: str, now: datetime | None = None) -> datetime:
+    """`--since` value -> aware UTC datetime. Relative (`5h`, `2d`, `90m`, `1w`) or a local date/time."""
+    now = now or datetime.now(timezone.utc)
+    v = value.strip().lower()
+    units = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    if len(v) > 1 and v[-1] in units and v[:-1].replace(".", "", 1).isdigit():
+        return now - timedelta(seconds=float(v[:-1]) * units[v[-1]])
+    dt = parse_iso_ts(value.replace(" ", "T", 1))
+    if dt is None:
+        raise argparse.ArgumentTypeError(f"can't read --since {value!r}; use 5h, 2d, 1w, 2026-10-20 or 2026-10-20T08:00")
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # naive input means the user's local time
+    if dt > now:
+        raise argparse.ArgumentTypeError(f"--since {value!r} is in the future")
+    return dt.astimezone(timezone.utc)
+
+
 def shorten_cwd(cwd: str | None) -> str:
     if not cwd:
         return "unknown"
@@ -346,7 +363,7 @@ def rate_limit_lines(codex: dict[str, object]) -> list[str]:
 def analyze_usage(
     turns: list[Turn], session_images: dict[str, list[tuple[datetime, int]]], used_mcps: set[str],
     configured_mcp: list[dict[str, str]], codex_daily: dict[str, dict[str, float]],
-    codex_rl: dict[str, object], window_days: int
+    codex_rl: dict[str, object], window_days: int, since: datetime | None = None
 ) -> dict[str, object]:
     tot_cost = sum(t.weighted_cost for t in turns)
     sessions: dict[str, list[Turn]] = {}
@@ -476,6 +493,7 @@ def analyze_usage(
 
     return {
         "window_days": window_days,
+        "since": since.astimezone(timezone.utc).isoformat() if since else None,
         "claude": {
             "total_turns": len(turns), "total_sessions": len(sessions), "total_weighted_tokens": tot_cost,
             "cost_findings": cost_findings, "unused_mcps": unused_mcps,
@@ -499,6 +517,11 @@ def analyze_usage(
     }
 
 
+def window_text(data: dict[str, object]) -> str:
+    since = parse_iso_ts(data.get("since"))
+    return f"since {since.strftime('%Y-%m-%d %H:%M UTC')}" if since else f"last {data['window_days']} days"
+
+
 def format_text(data: dict[str, object], is_tty: bool) -> str:
     b = "\033[1m" if is_tty else ""
     c = "\033[36m" if is_tty else ""
@@ -508,7 +531,7 @@ def format_text(data: dict[str, object], is_tty: bool) -> str:
 
     out = [
         f"{b}LIMIT DOCTOR v0.1{r}",
-        f"Window: last {data['window_days']} days | Weights: input 1, read 0.1, write 1.25 (5m) or 2 (1h), output 5",
+        f"Window: {window_text(data)} | Weights: input 1, read 0.1, write 1.25 (5m) or 2 (1h), output 5",
         "Percentages are shares of your own usage, not published plan limits.",
         "-" * 80,
         f"{b}CLAUDE CODE USAGE:{r} {tot:,.0f} weighted tokens across {claude.get('total_turns', 0):,} turns in {claude.get('total_sessions', 0):,} sessions\n",
@@ -586,7 +609,7 @@ def format_markdown(data: dict[str, object]) -> str:
     tot = claude.get("total_weighted_tokens", 0.0)
     lines = [
         "# Limit Doctor Report",
-        f"Window: last {data['window_days']} days. Cost model mirrors API price ratios (input 1.0, 5m write 1.25, 1h write 2.0, read 0.1, output 5.0). Percentages represent shares of internal usage.\n",
+        f"Window: {window_text(data)}. Cost model mirrors API price ratios (input 1.0, 5m write 1.25, 1h write 2.0, read 0.1, output 5.0). Percentages represent shares of internal usage.\n",
         f"## Claude Code Usage: {tot:,.0f} weighted tokens\n",
         "### Findings Ranked by Weighted Cost\n",
         "| Rank | Finding | Share | Weighted Tokens | Fix |\n| --- | --- | --- | --- | --- |"
@@ -627,6 +650,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="limit_doctor", description="Diagnose token usage drains and report actionable fixes.")
     for flag, kw in [
         ("--days", {"type": int, "default": 7, "help": "Window in days"}),
+        ("--since", {"type": parse_since, "default": None, "help": "Start of the window instead of --days: 5h, 2d, 1w, 2026-10-20 or 2026-10-20T08:00 (local time)"}),
         ("--json", {"action": "store_true", "help": "Machine output"}),
         ("--md", {"type": str, "default": "", "help": "Markdown output file"}),
         ("--claude-dir", {"type": str, "default": "", "help": "Claude config dir"}),
@@ -644,12 +668,12 @@ def main(argv: list[str] | None = None) -> int:
         if cand.is_file():
             cj_path = cand
             break
-    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+    cutoff = args.since or datetime.now(timezone.utc) - timedelta(days=args.days)
 
     turns, s_imgs, used_m, cwds = parse_claude_logs(c_dir, cutoff) if not args.no_claude else ([], {}, set(), set())
     cfg_m = find_configured_mcp_servers(c_dir, cj_path, cx_dir, cwds) if not args.no_claude else []
     cx_daily, cx_rl = parse_codex_logs(cx_dir, cutoff) if not args.no_codex else ({}, {})
-    rep = analyze_usage(turns, s_imgs, used_m, cfg_m, cx_daily, cx_rl, args.days)
+    rep = analyze_usage(turns, s_imgs, used_m, cfg_m, cx_daily, cx_rl, args.days, since=args.since)
 
     if args.json:
         print(json.dumps(rep, indent=2))

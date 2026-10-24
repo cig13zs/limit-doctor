@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `--since` starts the window at a point instead of `--days`: relative (`5h`, `2d`, `90m`, `1w`) or a date or time in your local zone (`2026-10-20`, `"2026-10-20 08:00"`). The report header and `--json` (`since`) show the start. The skill uses it when you ask about a specific stretch, such as since your limit last reset.
+
 ### Fixed
 
 - Codex: only the first rate-limit window was read, so the weekly limit never showed. The report now lists every window in the latest snapshot (5-hour and weekly) with its reset time. It also reads `resets_in_seconds` and the early flat `primary_used_percent` format. In `--json`, `codex.rate_limit_windows` holds the full list; `codex.rate_limits` keeps its v0.1 shape.
