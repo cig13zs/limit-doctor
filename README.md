@@ -25,7 +25,7 @@ TOP FINDINGS (ranked by weighted token cost; a turn can count in several):
    Count: 91 rebuilds
 
 Unused MCP servers (configured but 0 calls in window):
-  * ltspice (project (CLAUDE CODE OUTPUTS/School)) -> claude mcp remove ltspice -s project
+  * ltspice (project (projects/circuits)) -> claude mcp remove ltspice -s project
 ```
 
 Two thirds of it was subagents. I had no idea.
