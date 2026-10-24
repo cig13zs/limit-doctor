@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 from limit_doctor import (
@@ -14,10 +15,12 @@ from limit_doctor import (
     format_markdown,
     format_text,
     model_expense_tier,
+    normalize_rate_limits,
     parse_claude_logs,
     parse_codex_logs,
     parse_iso_ts,
     shorten_cwd,
+    window_label,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -147,7 +150,8 @@ class TestLimitDoctor(unittest.TestCase):
         # Weighted cost: (1000 - 400)*1.0 + 400*0.1 + 50*5.0 = 600 + 40 + 250 = 890.0
         self.assertAlmostEqual(day_data["weighted"], 890.0)
         # Rate limit
-        self.assertEqual(rl.get("used_percent"), 25.0)
+        self.assertEqual(rl["windows"][0]["used_percent"], 25.0)
+        self.assertEqual(rl["windows"][0]["resets_at"], 1791949620)
 
     def test_output_formatters(self):
         """Test text and markdown formatters."""
@@ -179,6 +183,42 @@ class TestLimitDoctor(unittest.TestCase):
         self.assertEqual(img["total_images"], 2)
         # turns at :01 and :02 carry 2 images each, the turn after compaction carries none
         self.assertAlmostEqual(img["weighted_cost"], 2 * 2 * 1600 * 0.1)
+
+    def test_codex_rate_limit_formats(self):
+        ts = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+        nested = normalize_rate_limits({
+            "primary": {"used_percent": 12.5, "window_minutes": 300, "resets_at": 1792000000},
+            "secondary": {"used_percent": 61.0, "window_minutes": 10080, "resets_in_seconds": 3600},
+        }, ts)
+        self.assertEqual([w["name"] for w in nested], ["primary", "secondary"])
+        self.assertEqual(nested[0]["resets_at"], 1792000000)
+        self.assertEqual(nested[1]["resets_at"], ts.timestamp() + 3600)
+        flat = normalize_rate_limits({"primary_used_percent": 40.0, "secondary_used_percent": 9.0,
+                                      "primary_window_minutes": 300, "secondary_window_minutes": 10080}, ts)
+        self.assertEqual([(w["used_percent"], w["window_minutes"], w["resets_at"]) for w in flat],
+                         [(40.0, 300, None), (9.0, 10080, None)])
+        self.assertEqual(normalize_rate_limits(None, ts), [])
+        self.assertEqual(normalize_rate_limits({"primary": None, "secondary": {"used_percent": None}}, ts), [])
+        self.assertEqual([window_label(m) for m in (300, 10080, 1440, 45, None)],
+                         ["5-hour window", "weekly window", "1-day window", "45-minute window", "unknown window"])
+
+    def test_codex_weekly_window_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            day = Path(tmp) / "sessions" / "2026" / "10" / "19"
+            day.mkdir(parents=True)
+            line = {"timestamp": "2026-10-19T12:00:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"last_token_usage": {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": 1}},
+                "rate_limits": {"primary": {"used_percent": 30.0, "window_minutes": 300, "resets_in_seconds": 600},
+                                "secondary": {"used_percent": 75.5, "window_minutes": 10080, "resets_in_seconds": 86400}}}}
+            (day / "rollout-a.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+            daily, rl = parse_codex_logs(Path(tmp), self.cutoff)
+        rep = analyze_usage([], {}, set(), [], daily, rl, 7)
+        self.assertEqual(rep["codex"]["rate_limits"]["used_percent"], 30.0)  # v0.1 shape kept
+        self.assertEqual(len(rep["codex"]["rate_limit_windows"]), 2)
+        text = format_text(rep, is_tty=False)
+        self.assertIn("5-hour window: 30.0% used, resets 2026-10-19 12:10 UTC", text)
+        self.assertIn("weekly window: 75.5% used, resets 2026-10-20 12:00 UTC", text)
+        self.assertIn("- weekly window: 75.5% used", format_markdown(rep))
 
 
 if __name__ == "__main__":
